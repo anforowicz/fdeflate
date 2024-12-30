@@ -63,11 +63,11 @@ pub const SECONDARY_TABLE_ENTRY: u32 = 0x2000;
 
 /// The Decompressor state for a compressed block.
 #[derive(Eq, PartialEq, Debug)]
-struct CompressedBlock {
-    litlen_table: Box<[u32; 4096]>,
+struct CompressedBlock<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> {
+    litlen_table: Box<[u32; LITLEN_TABLE_SIZE]>,
     secondary_table: Vec<u16>,
 
-    dist_table: Box<[u32; 512]>,
+    dist_table: Box<[u32; DIST_TABLE_SIZE]>,
     dist_secondary_table: Vec<u16>,
 
     eof_code: u16,
@@ -87,10 +87,50 @@ enum State {
     Done,
 }
 
-/// Decompressor for arbitrary zlib streams.
-pub struct Decompressor {
+/// Default decompressor for zlib streams.
+pub type Decompressor = GenericDecompressor<4096, 512>;
+
+/// Generic interface for decompressing.
+pub trait DecompressedRead {
+    /// Decompresses a chunk of data.
+    ///
+    /// Returns the number of bytes read from `input` and the number of bytes written to `output`,
+    /// or an error if the deflate stream is not valid. `input` is the compressed data. `output` is
+    /// the buffer to write the decompressed data to, starting at index `output_position`.
+    /// `end_of_input` indicates whether more data may be available in the future.
+    ///
+    /// The contents of `output` after `output_position` are ignored. However, this function may
+    /// write additional data to `output` past what is indicated by the return value.
+    ///
+    /// When this function returns `Ok`, at least one of the following is true:
+    /// - The input is fully consumed.
+    /// - The output is full but there are more bytes to output.
+    /// - The deflate stream is complete (and `is_done` will return true).
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `output_position` is out of bounds.
+    fn read(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        output_position: usize,
+        end_of_input: bool,
+    ) -> Result<(usize, usize), DecompressionError>;
+
+    /// Returns true if the decompressor has finished decompressing the input.
+    fn is_done(&self) -> bool;
+}
+
+/// Decompressor with configurable table sizes.
+///
+/// Bigger tables allow faster decompression, but take longer time to construct and may increase
+/// memory pressure (including L1 cache pressure, which may impact decompression speed).  Note that
+/// each decompressor configuration used in a binary will require monomorphization and therefore
+/// will increase the size of the resulting binary (by around 10kB per configuration used).
+pub struct GenericDecompressor<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> {
     /// State for decoding a compressed block.
-    compression: CompressedBlock,
+    compression: CompressedBlock<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>,
     // State for decoding a block header.
     header: BlockHeader,
     // Number of bytes left for uncompressed block.
@@ -109,21 +149,50 @@ pub struct Decompressor {
     ignore_adler32: bool,
 }
 
-impl Default for Decompressor {
+impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> Default
+    for GenericDecompressor<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decompressor {
+impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
+    GenericDecompressor<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>
+{
+    fn assert_table_sizes_are_valid() {
+        // `LITLEN_TABLE_MASK` calculation assumes that `LITLEN_TABLE_SIZE` is a power of two.
+        // `DIST_TABLE_MASK` calculation assumes that `DIST_TABLE_SIZE` is a power of two.
+        assert!(LITLEN_TABLE_SIZE.count_ones() == 1);
+        assert!(DIST_TABLE_SIZE.count_ones() == 1);
+
+        // Let's provide a conservative upper bound on table sizes for now.
+        assert!(Self::LITLEN_TABLE_BITS <= 12);
+        assert!(Self::DIST_TABLE_BITS <= 9);
+
+        // Let's provide a conservative lower bound on table sizes for now.
+        //
+        // One reason is that smaller `LITLEN_TABLE_SIZE` would require using
+        // a secondary table instead of just `FIXED_LITLEN_TABLE`.  This may be
+        // doable, but is not implemented yet.
+        assert!(FIXED_LITLEN_TABLE.len() <= LITLEN_TABLE_SIZE);
+        assert!(FIXED_DIST_TABLE.len() <= DIST_TABLE_SIZE);
+        // Another reason is that 1a) RFC1951 uses at most 15 bits for codewords
+        // and 1b) we can fit at most 8 bits of `overflow_bits_mask` in the last
+        // byte of a primary table entry.
+        assert!(Self::LITLEN_TABLE_BITS + 8 >= 15);
+        assert!(Self::DIST_TABLE_BITS + 8 >= 15);
+    }
+
     /// Create a new decompressor.
     pub fn new() -> Self {
+        Self::assert_table_sizes_are_valid();
         Self {
             buffer: 0,
             nbits: 0,
             compression: CompressedBlock {
-                litlen_table: Box::new([0; 4096]),
-                dist_table: Box::new([0; 512]),
+                litlen_table: Box::new([0; LITLEN_TABLE_SIZE]),
+                dist_table: Box::new([0; DIST_TABLE_SIZE]),
                 secondary_table: Vec::new(),
                 dist_secondary_table: Vec::new(),
                 eof_code: 0,
@@ -236,10 +305,18 @@ impl Decompressor {
                 // Build decoding tables if the previous block wasn't also a fixed block.
                 if !self.fixed_table {
                     self.fixed_table = true;
-                    for chunk in self.compression.litlen_table.chunks_exact_mut(512) {
+                    for chunk in self
+                        .compression
+                        .litlen_table
+                        .chunks_exact_mut(FIXED_LITLEN_TABLE.len())
+                    {
                         chunk.copy_from_slice(&FIXED_LITLEN_TABLE);
                     }
-                    for chunk in self.compression.dist_table.chunks_exact_mut(32) {
+                    for chunk in self
+                        .compression
+                        .dist_table
+                        .chunks_exact_mut(FIXED_DIST_TABLE.len())
+                    {
                         chunk.copy_from_slice(&FIXED_DIST_TABLE);
                     }
                     self.compression.eof_bits = 7;
@@ -398,7 +475,7 @@ impl Decompressor {
     fn build_tables(
         hlit: usize,
         code_lengths: &[u8],
-        compression: &mut CompressedBlock,
+        compression: &mut CompressedBlock<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>,
     ) -> Result<(), DecompressionError> {
         // If there is no code assigned for the EOF symbol then the bitstream is invalid.
         if code_lengths[256] == 0 {
@@ -446,6 +523,13 @@ impl Decompressor {
         Ok(())
     }
 
+    // In computations below we can assume that `LITLEN_TABLE_SIZE` and
+    // `DIST_TABLE_SIZE` are powers of two.  This is `assert!`ed in `fn new`.
+    const LITLEN_TABLE_MASK: u64 = (LITLEN_TABLE_SIZE as u64) - 1;
+    const LITLEN_TABLE_BITS: u32 = LITLEN_TABLE_SIZE.trailing_zeros() as u32;
+    const DIST_TABLE_MASK: u64 = (DIST_TABLE_SIZE as u64) - 1;
+    const DIST_TABLE_BITS: u32 = DIST_TABLE_SIZE.trailing_zeros() as u32;
+
     fn read_compressed(
         &mut self,
         remaining_input: &mut &[u8],
@@ -465,7 +549,8 @@ impl Decompressor {
         //   the bit buffer. This is because when the input is non-empty, the bit buffer actually
         //   has 64-bits of valid data (even though nbits will be in 56..=63).
         self.fill_buffer(remaining_input);
-        let mut litlen_entry = self.compression.litlen_table[(self.buffer & 0xfff) as usize];
+        let mut litlen_entry =
+            self.compression.litlen_table[(self.buffer & Self::LITLEN_TABLE_MASK) as usize];
         while self.state == State::CompressedData
             && output_index + 8 <= output.len()
             && remaining_input.len() >= 8
@@ -475,15 +560,21 @@ impl Decompressor {
             let mut bits;
             let mut litlen_code_bits = litlen_entry as u8;
             if litlen_entry & LITERAL_ENTRY != 0 {
-                let litlen_entry2 = self.compression.litlen_table
-                    [(self.buffer >> litlen_code_bits & 0xfff) as usize];
+                let litlen_entry2 = self.compression.litlen_table[(self
+                    .buffer
+                    .wrapping_shr(litlen_code_bits as u32)
+                    & Self::LITLEN_TABLE_MASK)
+                    as usize];
                 let litlen_code_bits2 = litlen_entry2 as u8;
-                let litlen_entry3 = self.compression.litlen_table
-                    [(self.buffer >> (litlen_code_bits + litlen_code_bits2) & 0xfff) as usize];
+                let litlen_entry3 = self.compression.litlen_table[(self
+                    .buffer
+                    .wrapping_shr((litlen_code_bits + litlen_code_bits2) as u32)
+                    & Self::LITLEN_TABLE_MASK)
+                    as usize];
                 let litlen_code_bits3 = litlen_entry3 as u8;
-                let litlen_entry4 = self.compression.litlen_table[(self.buffer
-                    >> (litlen_code_bits + litlen_code_bits2 + litlen_code_bits3)
-                    & 0xfff)
+                let litlen_entry4 = self.compression.litlen_table[(self.buffer.wrapping_shr(
+                    (litlen_code_bits + litlen_code_bits2 + litlen_code_bits3) as u32,
+                ) & Self::LITLEN_TABLE_MASK)
                     as usize];
 
                 let advance_output_bytes = ((litlen_entry & 0xf00) >> 8) as usize;
@@ -536,8 +627,8 @@ impl Decompressor {
                         litlen_code_bits,
                     )
                 } else if litlen_entry & SECONDARY_TABLE_ENTRY != 0 {
-                    let secondary_table_index =
-                        (litlen_entry >> 16) + ((bits >> 12) as u32 & (litlen_entry & 0xff));
+                    let secondary_table_index = (litlen_entry >> 16)
+                        + ((bits >> Self::LITLEN_TABLE_BITS) as u32 & (litlen_entry & 0xff));
                     let secondary_entry =
                         self.compression.secondary_table[secondary_table_index as usize];
                     let litlen_symbol = secondary_entry >> 4;
@@ -546,8 +637,8 @@ impl Decompressor {
                     match litlen_symbol {
                         0..=255 => {
                             self.consume_bits(litlen_code_bits);
-                            litlen_entry =
-                                self.compression.litlen_table[(self.buffer & 0xfff) as usize];
+                            litlen_entry = self.compression.litlen_table
+                                [(self.buffer & Self::LITLEN_TABLE_MASK) as usize];
                             self.fill_buffer(remaining_input);
                             output[output_index] = litlen_symbol as u8;
                             output_index += 1;
@@ -583,7 +674,7 @@ impl Decompressor {
             let length = length_base as usize + (bits & length_extra_mask) as usize;
             bits >>= length_extra_bits;
 
-            let dist_entry = self.compression.dist_table[(bits & 0x1ff) as usize];
+            let dist_entry = self.compression.dist_table[(bits & Self::DIST_TABLE_MASK) as usize];
             let (dist_base, dist_extra_bits, dist_code_bits) = if dist_entry & LITERAL_ENTRY != 0 {
                 (
                     (dist_entry >> 16) as u16,
@@ -593,8 +684,8 @@ impl Decompressor {
             } else if dist_entry >> 8 == 0 {
                 return Err(DecompressionError::InvalidDistanceCode);
             } else {
-                let secondary_table_index =
-                    (dist_entry >> 16) + ((bits >> 9) as u32 & (dist_entry & 0xff));
+                let secondary_table_index = (dist_entry >> 16)
+                    + ((bits >> Self::DIST_TABLE_BITS) as u32 & (dist_entry & 0xff));
                 let secondary_entry =
                     self.compression.dist_secondary_table[secondary_table_index as usize];
                 let dist_symbol = (secondary_entry >> 4) as usize;
@@ -619,7 +710,8 @@ impl Decompressor {
                 litlen_code_bits + length_extra_bits + dist_code_bits + dist_extra_bits,
             );
             self.fill_buffer(remaining_input);
-            litlen_entry = self.compression.litlen_table[(self.buffer & 0xfff) as usize];
+            litlen_entry =
+                self.compression.litlen_table[(self.buffer & Self::LITLEN_TABLE_MASK) as usize];
 
             let copy_length = length.min(output.len() - output_index);
             if dist == 1 {
@@ -672,11 +764,12 @@ impl Decompressor {
             }
 
             let mut bits = self.buffer;
-            let litlen_entry = self.compression.litlen_table[(bits & 0xfff) as usize];
+            let litlen_entry =
+                self.compression.litlen_table[(bits & Self::LITLEN_TABLE_MASK) as usize];
             let litlen_code_bits = litlen_entry as u8;
 
             if litlen_entry & LITERAL_ENTRY != 0 {
-                // Fast path: the next symbol is <= 12 bits and a literal, the table specifies the
+                // Fast path: the next symbol is <= LITLEN_TABLE_BITS bits and a literal, the table specifies the
                 // output bytes and we can directly write them to the output buffer.
                 let advance_output_bytes = ((litlen_entry & 0xf00) >> 8) as usize;
 
@@ -712,8 +805,8 @@ impl Decompressor {
                         litlen_code_bits,
                     )
                 } else if litlen_entry & SECONDARY_TABLE_ENTRY != 0 {
-                    let secondary_table_index =
-                        (litlen_entry >> 16) + ((bits >> 12) as u32 & (litlen_entry & 0xff));
+                    let secondary_table_index = (litlen_entry >> 16)
+                        + ((bits >> Self::LITLEN_TABLE_BITS) as u32 & (litlen_entry & 0xff));
                     let secondary_entry =
                         self.compression.secondary_table[secondary_table_index as usize];
                     let litlen_symbol = secondary_entry >> 4;
@@ -759,20 +852,22 @@ impl Decompressor {
             let length = length_base as usize + (bits & length_extra_mask) as usize;
             bits >>= length_extra_bits;
 
-            let dist_entry = self.compression.dist_table[(bits & 0x1ff) as usize];
+            let dist_entry = self.compression.dist_table[(bits & Self::DIST_TABLE_MASK) as usize];
             let (dist_base, dist_extra_bits, dist_code_bits) = if dist_entry & LITERAL_ENTRY != 0 {
                 (
                     (dist_entry >> 16) as u16,
                     (dist_entry >> 8) as u8 & 0xf,
                     dist_entry as u8,
                 )
-            } else if self.nbits > litlen_code_bits + length_extra_bits + 9 {
+            } else if self.nbits
+                > litlen_code_bits + length_extra_bits + Self::DIST_TABLE_BITS as u8
+            {
                 if dist_entry >> 8 == 0 {
                     return Err(DecompressionError::InvalidDistanceCode);
                 }
 
-                let secondary_table_index =
-                    (dist_entry >> 16) + ((bits >> 9) as u32 & (dist_entry & 0xff));
+                let secondary_table_index = (dist_entry >> 16)
+                    + ((bits >> Self::DIST_TABLE_BITS) as u32 & (dist_entry & 0xff));
                 let secondary_entry =
                     self.compression.dist_secondary_table[secondary_table_index as usize];
                 let dist_symbol = (secondary_entry >> 4) as usize;
@@ -857,26 +952,12 @@ impl Decompressor {
 
         Ok(output_index)
     }
+}
 
-    /// Decompresses a chunk of data.
-    ///
-    /// Returns the number of bytes read from `input` and the number of bytes written to `output`,
-    /// or an error if the deflate stream is not valid. `input` is the compressed data. `output` is
-    /// the buffer to write the decompressed data to, starting at index `output_position`.
-    /// `end_of_input` indicates whether more data may be available in the future.
-    ///
-    /// The contents of `output` after `output_position` are ignored. However, this function may
-    /// write additional data to `output` past what is indicated by the return value.
-    ///
-    /// When this function returns `Ok`, at least one of the following is true:
-    /// - The input is fully consumed.
-    /// - The output is full but there are more bytes to output.
-    /// - The deflate stream is complete (and `is_done` will return true).
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if `output_position` is out of bounds.
-    pub fn read(
+impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> DecompressedRead
+    for GenericDecompressor<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>
+{
+    fn read(
         &mut self,
         input: &[u8],
         output: &mut [u8],
@@ -1021,8 +1102,7 @@ impl Decompressor {
         }
     }
 
-    /// Returns true if the decompressor has finished decompressing the input.
-    pub fn is_done(&self) -> bool {
+    fn is_done(&self) -> bool {
         self.state == State::Done
     }
 }
@@ -1163,7 +1243,7 @@ mod tests {
 
     #[test]
     fn fixed_tables() {
-        let mut compression = CompressedBlock {
+        let mut compression = CompressedBlock::<4096, 512> {
             litlen_table: Box::new([0; 4096]),
             dist_table: Box::new([0; 512]),
             secondary_table: Vec::new(),
@@ -1172,7 +1252,8 @@ mod tests {
             eof_mask: 0,
             eof_bits: 0,
         };
-        Decompressor::build_tables(288, &FIXED_CODE_LENGTHS, &mut compression).unwrap();
+        GenericDecompressor::<4096, 512>::build_tables(288, &FIXED_CODE_LENGTHS, &mut compression)
+            .unwrap();
 
         assert_eq!(compression.litlen_table[..512], FIXED_LITLEN_TABLE);
         assert_eq!(compression.dist_table[..32], FIXED_DIST_TABLE);
@@ -1284,7 +1365,7 @@ mod tests {
 
     mod test_utils;
     use tables::FIXED_CODE_LENGTHS;
-    use test_utils::{decompress_by_chunks, TestDecompressionError};
+    use test_utils::{decompress_by_chunks, decompress_with_table_sizes, TestDecompressionError};
 
     fn verify_no_sensitivity_to_input_chunking(
         input: &[u8],
@@ -1293,6 +1374,20 @@ mod tests {
         let r_bytewise = decompress_by_chunks(input, std::iter::repeat(1), false);
         assert_eq!(r_whole, r_bytewise);
         r_whole // Returning an arbitrary result, since this is equal to `r_bytewise`.
+    }
+
+    fn verify_no_sensitivity_to_table_sizes<
+        const LITLEN_TABLE_SIZE1: usize,
+        const DIST_TABLE_SIZE1: usize,
+        const LITLEN_TABLE_SIZE2: usize,
+        const DIST_TABLE_SIZE2: usize,
+    >(
+        input: &[u8],
+    ) -> Result<Vec<u8>, TestDecompressionError> {
+        let r1 = decompress_with_table_sizes::<LITLEN_TABLE_SIZE1, DIST_TABLE_SIZE1>(input);
+        let r2 = decompress_with_table_sizes::<LITLEN_TABLE_SIZE2, DIST_TABLE_SIZE2>(input);
+        assert_eq!(r1, r2);
+        r1 // Returning an arbitrary result, since this is equal to `r2`.
     }
 
     /// This is a regression test found by the `buf_independent` fuzzer from the `png` crate.  When
@@ -1338,6 +1433,31 @@ mod tests {
         assert_eq!(
             err,
             TestDecompressionError::ProdError(DecompressionError::BadLiteralLengthHuffmanTree)
+        );
+    }
+
+    /// This is a regression test found by the `inflate_with_different_table_sizes` fuzzer from the
+    /// `fdeflate` crate.  When this test case was found, the 512/32 table would panic when
+    /// shifting by more than 64 bits here:
+    ///
+    ///     `self.buffer >> (litlen_code_bits + litlen_code_bits2 + litlen_code_bits3)`
+    ///
+    /// This was happening because `litlen_code_bits3` haven't yet been checked if it really is
+    /// a `LITERAL_ENTRY` and it really was a `SECONDARY_TABLE_ENTRY`.  Small primary table
+    /// size, the `overflow_bits_mask` stored in the last byte was 63.  And so above
+    /// `litlen_code_bits3` was set to 63.
+    ///
+    /// In general, this test can be seen as checking that the least significant byte of an entry
+    /// is 63 or less.
+    #[test]
+    fn test_different_table_sizes_512_128_no_big_shifts() {
+        let err = verify_no_sensitivity_to_table_sizes::<4096, 512, 512, 128>(include_bytes!(
+            "../tests/table-size-trouble.zz"
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            TestDecompressionError::ProdError(DecompressionError::InsufficientInput)
         );
     }
 }
