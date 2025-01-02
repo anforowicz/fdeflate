@@ -67,3 +67,9 @@ name = "inflate_split"
 path = "fuzz_targets/inflate_split.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "inflate_with_initially_small_table_sizes"
+path = "fuzz_targets/inflate_with_initially_small_table_sizes.rs"
+test = false
+doc = false

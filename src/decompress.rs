@@ -100,11 +100,16 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
-    /// Create a new decompressor.
-    pub fn new() -> Self {
+    fn internal_new(tables_config: TablesConfig) -> Self {
+        let compression = match tables_config {
+            TablesConfig::BigTables => {
+                Box::new(CompressedBlock::<4096, 512>::new()) as Box<dyn CompressedBlockHandler>
+            }
+            TablesConfig::SmallTables => Box::new(CompressedBlock::<512, 128>::new()),
+        };
         Self {
             bits: BitBuffer::new(),
-            compression: Box::new(CompressedBlock::<4096, 512>::new()),
+            compression,
             header: BlockHeader {
                 hlit: 0,
                 hdist: 0,
@@ -120,6 +125,16 @@ impl Decompressor {
             last_block: false,
             ignore_adler32: false,
         }
+    }
+
+    /// Create a new decompressor.
+    pub fn new() -> Self {
+        Self::internal_new(TablesConfig::BigTables)
+    }
+
+    /// Create a new decompressor optimized for small inputs.
+    pub fn for_small_input() -> Self {
+        Self::internal_new(TablesConfig::SmallTables)
     }
 
     /// Ignore the checksum at the end of the stream.
@@ -1122,6 +1137,12 @@ enum CompressedBlockStatus {
     ReachedEndOfBlock,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum TablesConfig {
+    BigTables,
+    SmallTables,
+}
+
 /// Decompress the given data.
 pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>, DecompressionError> {
     match decompress_to_vec_bounded(input, usize::MAX) {
@@ -1385,8 +1406,9 @@ mod tests {
     fn verify_no_sensitivity_to_input_chunking(
         input: &[u8],
     ) -> Result<Vec<u8>, TestDecompressionError> {
-        let r_whole = decompress_by_chunks(input, vec![input.len()], false);
-        let r_bytewise = decompress_by_chunks(input, std::iter::repeat(1), false);
+        let r_whole = decompress_by_chunks(Decompressor::new(), input, vec![input.len()], false);
+        let r_bytewise =
+            decompress_by_chunks(Decompressor::new(), input, std::iter::repeat(1), false);
         assert_eq!(r_whole, r_bytewise);
         r_whole // Returning an arbitrary result, since this is equal to `r_bytewise`.
     }
