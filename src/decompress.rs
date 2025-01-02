@@ -77,7 +77,7 @@ enum State {
 /// Decompressor for arbitrary zlib streams.
 pub struct Decompressor {
     /// State for decoding a compressed block.
-    compression: CompressedBlock<4096, 512>,
+    compression: Box<CompressedBlock<4096, 512>>,
     // State for decoding a block header.
     header: BlockHeader,
     // Number of bytes left for uncompressed block.
@@ -105,7 +105,7 @@ impl Decompressor {
     pub fn new() -> Self {
         Self {
             bits: BitBuffer::new(),
-            compression: CompressedBlock::new(),
+            compression: Box::new(CompressedBlock::new()),
             header: BlockHeader {
                 hlit: 0,
                 hdist: 0,
@@ -334,7 +334,8 @@ impl Decompressor {
             self.header.code_lengths[i] = 0;
         }
 
-        self.compression.build_tables(self.header.hlit, &self.header.code_lengths)?;
+        self.compression
+            .build_tables(self.header.hlit, &self.header.code_lengths)?;
         self.state = State::CompressedData;
         Ok(())
     }
@@ -531,10 +532,10 @@ impl Decompressor {
 /// The Decompressor state for a compressed block.
 #[derive(Eq, PartialEq, Debug)]
 struct CompressedBlock<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> {
-    litlen_table: Box<[u32; LITLEN_TABLE_SIZE]>,
+    litlen_table: [u32; LITLEN_TABLE_SIZE],
     secondary_table: Vec<u16>,
 
-    dist_table: Box<[u32; DIST_TABLE_SIZE]>,
+    dist_table: [u32; DIST_TABLE_SIZE],
     dist_secondary_table: Vec<u16>,
 
     eof_code: u16,
@@ -589,8 +590,8 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
         Self::assert_table_sizes_are_valid();
 
         Self {
-            litlen_table: Box::new([0; LITLEN_TABLE_SIZE]),
-            dist_table: Box::new([0; DIST_TABLE_SIZE]),
+            litlen_table: [0; LITLEN_TABLE_SIZE],
+            dist_table: [0; DIST_TABLE_SIZE],
             secondary_table: Vec::new(),
             dist_secondary_table: Vec::new(),
             eof_code: 0,
@@ -599,11 +600,7 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
         }
     }
 
-    fn build_tables(
-        &mut self,
-        hlit: usize,
-        code_lengths: &[u8],
-    ) -> Result<(), DecompressionError> {
+    fn build_tables(&mut self, hlit: usize, code_lengths: &[u8]) -> Result<(), DecompressionError> {
         // If there is no code assigned for the EOF symbol then the bitstream is invalid.
         if code_lengths[256] == 0 {
             // TODO: Return a dedicated error in this case.
@@ -616,7 +613,7 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
             &code_lengths[..hlit],
             &LITLEN_TABLE_ENTRIES,
             &mut codes[..hlit],
-            &mut *self.litlen_table,
+            &mut self.litlen_table,
             &mut self.secondary_table,
             false,
             true,
@@ -638,7 +635,7 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
                 lengths,
                 &tables::DISTANCE_TABLE_ENTRIES,
                 &mut dist_codes,
-                &mut *self.dist_table,
+                &mut self.dist_table,
                 &mut self.dist_secondary_table,
                 true,
                 false,
@@ -1241,8 +1238,8 @@ mod tests {
     #[test]
     fn fixed_tables() {
         let mut compression = CompressedBlock {
-            litlen_table: Box::new([0; 4096]),
-            dist_table: Box::new([0; 512]),
+            litlen_table: [0; 4096],
+            dist_table: [0; 512],
             secondary_table: Vec::new(),
             dist_secondary_table: Vec::new(),
             eof_code: 0,
