@@ -9,6 +9,9 @@ use crate::{
     },
 };
 
+mod magic_numbers;
+use magic_numbers::*;
+
 /// An error encountered while decompressing a deflate stream.
 #[derive(Debug, PartialEq, Clone)]
 pub enum DecompressionError {
@@ -91,6 +94,10 @@ pub struct Decompressor {
     state: State,
     checksum: Adler32,
     ignore_adler32: bool,
+
+    total_size_of_compressed_blocks: usize,
+    compressed_blocks_count: usize,
+    tables_config: TablesConfig,
 }
 
 impl Default for Decompressor {
@@ -101,15 +108,9 @@ impl Default for Decompressor {
 
 impl Decompressor {
     fn internal_new(tables_config: TablesConfig) -> Self {
-        let compression = match tables_config {
-            TablesConfig::BigTables => {
-                Box::new(CompressedBlock::<4096, 512>::new()) as Box<dyn CompressedBlockHandler>
-            }
-            TablesConfig::SmallTables => Box::new(CompressedBlock::<512, 128>::new()),
-        };
         Self {
             bits: BitBuffer::new(),
-            compression,
+            compression: tables_config.new_compressed_block_handler(),
             header: BlockHeader {
                 hlit: 0,
                 hdist: 0,
@@ -124,6 +125,9 @@ impl Decompressor {
             state: State::ZlibHeader,
             last_block: false,
             ignore_adler32: false,
+            total_size_of_compressed_blocks: 0,
+            compressed_blocks_count: 0,
+            tables_config,
         }
     }
 
@@ -434,6 +438,7 @@ impl Decompressor {
                     self.read_code_lengths(&mut remaining_input)?;
                 }
                 State::CompressedData => {
+                    let old_remaining_input_len = remaining_input.len();
                     let (compresed_block_status, new_output_index) =
                         self.compression.read_compressed(
                             &mut self.bits,
@@ -442,12 +447,17 @@ impl Decompressor {
                             output_index,
                             &mut self.queued_output,
                         )?;
+                    let consumed_input = old_remaining_input_len - remaining_input.len();
+                    self.total_size_of_compressed_blocks += consumed_input;
                     output_index = new_output_index;
                     if compresed_block_status == CompressedBlockStatus::ReachedEndOfBlock {
-                        self.state = match self.last_block {
-                            true => State::Checksum,
-                            false => State::BlockHeader,
-                        };
+                        self.compressed_blocks_count += 1;
+                        if self.last_block {
+                            self.state = State::Checksum;
+                        } else {
+                            self.state = State::BlockHeader;
+                            self.adjust_table_sizes_if_needed();
+                        }
                     }
                 }
                 State::UncompressedData => {
@@ -519,6 +529,26 @@ impl Decompressor {
             Ok((input.len() - input_left, output_index - output_position))
         } else {
             Err(DecompressionError::InsufficientInput)
+        }
+    }
+
+    fn adjust_table_sizes_if_needed(&mut self) {
+        debug_assert!(self.state != State::CompressedData);
+
+        let avg_block_size = self.total_size_of_compressed_blocks / self.compressed_blocks_count;
+        match self.tables_config {
+            TablesConfig::BigTables => {
+                if avg_block_size < SMALL_TABLE_THRESHOLD - ANTI_FLIP_FLOP_MARGIN {
+                    self.tables_config = TablesConfig::SmallTables;
+                    self.compression = self.tables_config.new_compressed_block_handler();
+                }
+            }
+            TablesConfig::SmallTables => {
+                if avg_block_size > SMALL_TABLE_THRESHOLD + ANTI_FLIP_FLOP_MARGIN {
+                    self.tables_config = TablesConfig::BigTables;
+                    self.compression = self.tables_config.new_compressed_block_handler();
+                }
+            }
         }
     }
 
@@ -1141,6 +1171,17 @@ enum CompressedBlockStatus {
 enum TablesConfig {
     BigTables,
     SmallTables,
+}
+
+impl TablesConfig {
+    fn new_compressed_block_handler(&self) -> Box<dyn CompressedBlockHandler> {
+        match self {
+            TablesConfig::BigTables => {
+                Box::new(CompressedBlock::<4096, 512>::new()) as Box<dyn CompressedBlockHandler>
+            }
+            TablesConfig::SmallTables => Box::new(CompressedBlock::<512, 128>::new()),
+        }
+    }
 }
 
 /// Decompress the given data.
