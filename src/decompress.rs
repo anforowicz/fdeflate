@@ -87,7 +87,6 @@ pub struct Decompressor {
 
     queued_output: Option<QueuedOutput>,
     last_block: bool,
-    fixed_table: bool,
 
     state: State,
     checksum: Adler32,
@@ -120,7 +119,6 @@ impl Decompressor {
             state: State::ZlibHeader,
             last_block: false,
             ignore_adler32: false,
-            fixed_table: false,
         }
     }
 
@@ -181,20 +179,7 @@ impl Decompressor {
                     return self.read_block_header(remaining_input);
                 }
 
-                // Build decoding tables if the previous block wasn't also a fixed block.
-                if !self.fixed_table {
-                    self.fixed_table = true;
-                    for chunk in self.compression.litlen_table.chunks_exact_mut(512) {
-                        chunk.copy_from_slice(&FIXED_LITLEN_TABLE);
-                    }
-                    for chunk in self.compression.dist_table.chunks_exact_mut(32) {
-                        chunk.copy_from_slice(&FIXED_DIST_TABLE);
-                    }
-                    self.compression.eof_bits = 7;
-                    self.compression.eof_code = 0;
-                    self.compression.eof_mask = 0x7f;
-                }
-
+                self.compression.build_fixed_tables();
                 self.state = State::CompressedData;
                 Ok(())
             }
@@ -215,7 +200,6 @@ impl Decompressor {
 
                 self.bits.consume_bits(17);
                 self.state = State::CodeLengthCodes;
-                self.fixed_table = false;
                 Ok(())
             }
             0b11 => Err(DecompressionError::InvalidBlockType),
@@ -541,6 +525,8 @@ struct CompressedBlock<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: us
     eof_code: u16,
     eof_mask: u16,
     eof_bits: u8,
+
+    fixed_table: bool,
 }
 
 impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
@@ -597,10 +583,13 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
             eof_code: 0,
             eof_mask: 0,
             eof_bits: 0,
+            fixed_table: false,
         }
     }
 
     fn build_tables(&mut self, hlit: usize, code_lengths: &[u8]) -> Result<(), DecompressionError> {
+        self.fixed_table = false;
+
         // If there is no code assigned for the EOF symbol then the bitstream is invalid.
         if code_lengths[256] == 0 {
             // TODO: Return a dedicated error in this case.
@@ -645,6 +634,21 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
         }
 
         Ok(())
+    }
+
+    fn build_fixed_tables(&mut self) {
+        if !self.fixed_table {
+            self.fixed_table = true;
+            for chunk in self.litlen_table.chunks_exact_mut(512) {
+                chunk.copy_from_slice(&FIXED_LITLEN_TABLE);
+            }
+            for chunk in self.dist_table.chunks_exact_mut(32) {
+                chunk.copy_from_slice(&FIXED_DIST_TABLE);
+            }
+            self.eof_bits = 7;
+            self.eof_code = 0;
+            self.eof_mask = 0x7f;
+        }
     }
 
     /// Returns:
@@ -1245,6 +1249,7 @@ mod tests {
             eof_code: 0,
             eof_mask: 0,
             eof_bits: 0,
+            fixed_table: false,
         };
         compression.build_tables(288, &FIXED_CODE_LENGTHS).unwrap();
 
