@@ -77,7 +77,7 @@ enum State {
 /// Decompressor for arbitrary zlib streams.
 pub struct Decompressor {
     /// State for decoding a compressed block.
-    compression: Box<CompressedBlock<4096, 512>>,
+    compression: Box<dyn CompressedBlockHandler>,
     // State for decoding a block header.
     header: BlockHeader,
     // Number of bytes left for uncompressed block.
@@ -104,7 +104,7 @@ impl Decompressor {
     pub fn new() -> Self {
         Self {
             bits: BitBuffer::new(),
-            compression: Box::new(CompressedBlock::new()),
+            compression: Box::new(CompressedBlock::<4096, 512>::new()),
             header: BlockHeader {
                 hlit: 0,
                 hdist: 0,
@@ -586,7 +586,24 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
             fixed_table: false,
         }
     }
+}
 
+trait CompressedBlockHandler {
+    fn build_tables(&mut self, hlit: usize, code_lengths: &[u8]) -> Result<(), DecompressionError>;
+    fn build_fixed_tables(&mut self);
+    fn read_compressed(
+        &self,
+        bit_buffer: &mut BitBuffer,
+        remaining_input: &mut &[u8],
+        output: &mut [u8],
+        output_index: usize,
+        queued_output: &mut Option<QueuedOutput>,
+    ) -> Result<(CompressedBlockStatus, usize), DecompressionError>;
+}
+
+impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> CompressedBlockHandler
+    for CompressedBlock<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>
+{
     fn build_tables(&mut self, hlit: usize, code_lengths: &[u8]) -> Result<(), DecompressionError> {
         self.fixed_table = false;
 
