@@ -62,20 +62,6 @@ pub const LITERAL_ENTRY: u32 = 0x8000;
 pub const EXCEPTIONAL_ENTRY: u32 = 0x4000;
 pub const SECONDARY_TABLE_ENTRY: u32 = 0x2000;
 
-/// The Decompressor state for a compressed block.
-#[derive(Eq, PartialEq, Debug)]
-struct CompressedBlock {
-    litlen_table: Box<[u32; 4096]>,
-    secondary_table: Vec<u16>,
-
-    dist_table: Box<[u32; 512]>,
-    dist_secondary_table: Vec<u16>,
-
-    eof_code: u16,
-    eof_mask: u16,
-    eof_bits: u8,
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum State {
     ZlibHeader,
@@ -119,15 +105,7 @@ impl Decompressor {
     pub fn new() -> Self {
         Self {
             bits: BitBuffer::new(),
-            compression: CompressedBlock {
-                litlen_table: Box::new([0; 4096]),
-                dist_table: Box::new([0; 512]),
-                secondary_table: Vec::new(),
-                dist_secondary_table: Vec::new(),
-                eof_code: 0,
-                eof_mask: 0,
-                eof_bits: 0,
-            },
+            compression: CompressedBlock::new(),
             header: BlockHeader {
                 hlit: 0,
                 hdist: 0,
@@ -605,7 +583,33 @@ impl Decompressor {
     }
 }
 
+/// The Decompressor state for a compressed block.
+#[derive(Eq, PartialEq, Debug)]
+struct CompressedBlock {
+    litlen_table: Box<[u32; 4096]>,
+    secondary_table: Vec<u16>,
+
+    dist_table: Box<[u32; 512]>,
+    dist_secondary_table: Vec<u16>,
+
+    eof_code: u16,
+    eof_mask: u16,
+    eof_bits: u8,
+}
+
 impl CompressedBlock {
+    fn new() -> Self {
+        Self {
+            litlen_table: Box::new([0; 4096]),
+            dist_table: Box::new([0; 512]),
+            secondary_table: Vec::new(),
+            dist_secondary_table: Vec::new(),
+            eof_code: 0,
+            eof_mask: 0,
+            eof_bits: 0,
+        }
+    }
+
     /// Returns:
     /// - Whether this compressed block ended or not
     /// - The new value of `output_index`
