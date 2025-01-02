@@ -77,7 +77,7 @@ enum State {
 /// Decompressor for arbitrary zlib streams.
 pub struct Decompressor {
     /// State for decoding a compressed block.
-    compression: CompressedBlock,
+    compression: CompressedBlock<4096, 512>,
     // State for decoding a block header.
     header: BlockHeader,
     // Number of bytes left for uncompressed block.
@@ -346,7 +346,7 @@ impl Decompressor {
     fn build_tables(
         hlit: usize,
         code_lengths: &[u8],
-        compression: &mut CompressedBlock,
+        compression: &mut CompressedBlock<4096, 512>,
     ) -> Result<(), DecompressionError> {
         // If there is no code assigned for the EOF symbol then the bitstream is invalid.
         if code_lengths[256] == 0 {
@@ -585,11 +585,11 @@ impl Decompressor {
 
 /// The Decompressor state for a compressed block.
 #[derive(Eq, PartialEq, Debug)]
-struct CompressedBlock {
-    litlen_table: Box<[u32; 4096]>,
+struct CompressedBlock<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize> {
+    litlen_table: Box<[u32; LITLEN_TABLE_SIZE]>,
     secondary_table: Vec<u16>,
 
-    dist_table: Box<[u32; 512]>,
+    dist_table: Box<[u32; DIST_TABLE_SIZE]>,
     dist_secondary_table: Vec<u16>,
 
     eof_code: u16,
@@ -597,11 +597,55 @@ struct CompressedBlock {
     eof_bits: u8,
 }
 
-impl CompressedBlock {
+impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
+    CompressedBlock<LITLEN_TABLE_SIZE, DIST_TABLE_SIZE>
+{
+    fn assert_table_sizes_are_valid() {
+        // `LITLEN_TABLE_MASK` calculation assumes that `LITLEN_TABLE_SIZE` is a power of two.
+        // `DIST_TABLE_MASK` calculation assumes that `DIST_TABLE_SIZE` is a power of two.
+        assert!(
+            LITLEN_TABLE_SIZE.count_ones() == 1,
+            "LITLEN_TABLE_SIZE should be a power of two"
+        );
+        assert!(
+            DIST_TABLE_SIZE.count_ones() == 1,
+            "DIST_TABLE_SIZE should be a power of two"
+        );
+
+        // Let's provide a conservative upper bound on table sizes for now.
+        assert!(Self::LITLEN_TABLE_BITS <= 12);
+        assert!(Self::DIST_TABLE_BITS <= 9);
+
+        // Let's provide a conservative lower bound on table sizes for now.
+        //
+        // One reason is that smaller `LITLEN_TABLE_SIZE` would require using
+        // a secondary table instead of just `FIXED_LITLEN_TABLE`.  This may be
+        // doable, but is not implemented yet.
+        assert!(FIXED_LITLEN_TABLE.len() <= LITLEN_TABLE_SIZE);
+        assert!(FIXED_DIST_TABLE.len() <= DIST_TABLE_SIZE);
+        // Another reason is that 1a) RFC1951 uses at most 15 bits for codewords
+        // and 1b) we can fit at most 8 bits of `overflow_bits_mask` in the last
+        // byte of a primary table entry.
+        assert!(Self::LITLEN_TABLE_BITS + 8 >= 15);
+        assert!(Self::DIST_TABLE_BITS + 8 >= 15);
+    }
+
+    // In computations below we can assume that `LITLEN_TABLE_SIZE` and
+    // `DIST_TABLE_SIZE` are powers of two.  This is `assert!`ed in `fn new`.
+    const LITLEN_TABLE_MASK: u64 = (LITLEN_TABLE_SIZE as u64) - 1;
+    const LITLEN_TABLE_BITS: u32 = LITLEN_TABLE_SIZE.trailing_zeros() as u32;
+    const DIST_TABLE_MASK: u64 = (DIST_TABLE_SIZE as u64) - 1;
+    const DIST_TABLE_BITS: u32 = DIST_TABLE_SIZE.trailing_zeros() as u32;
+
     fn new() -> Self {
+        // TODO(https://github.com/rust-lang/rust/issues/76560): When `rustc` stabilizes and ships
+        // with support for generic constant expressions, the runtime check below should be changed
+        // into a compile-time check.
+        Self::assert_table_sizes_are_valid();
+
         Self {
-            litlen_table: Box::new([0; 4096]),
-            dist_table: Box::new([0; 512]),
+            litlen_table: Box::new([0; LITLEN_TABLE_SIZE]),
+            dist_table: Box::new([0; DIST_TABLE_SIZE]),
             secondary_table: Vec::new(),
             dist_secondary_table: Vec::new(),
             eof_code: 0,
@@ -634,23 +678,25 @@ impl CompressedBlock {
         //   the bit buffer. This is because when the input is non-empty, the bit buffer actually
         //   has 64-bits of valid data (even though nbits will be in 56..=63).
         bit_buffer.fill_buffer(remaining_input);
-        let mut litlen_entry = self.litlen_table[(bit_buffer.buffer & 0xfff) as usize];
+        let mut litlen_entry =
+            self.litlen_table[(bit_buffer.buffer & Self::LITLEN_TABLE_MASK) as usize];
         while output_index + 8 <= output.len() && remaining_input.len() >= 8 {
             // First check whether the next symbol is a literal. This code does up to 2 additional
             // table lookups to decode more literals.
             let mut bits;
             let mut litlen_code_bits = litlen_entry as u8;
             if litlen_entry & LITERAL_ENTRY != 0 {
-                let litlen_entry2 =
-                    self.litlen_table[(bit_buffer.buffer >> litlen_code_bits & 0xfff) as usize];
+                let litlen_entry2 = self.litlen_table
+                    [(bit_buffer.buffer >> litlen_code_bits & Self::LITLEN_TABLE_MASK) as usize];
                 let litlen_code_bits2 = litlen_entry2 as u8;
-                let litlen_entry3 = self.litlen_table[(bit_buffer.buffer
-                    >> (litlen_code_bits + litlen_code_bits2)
-                    & 0xfff) as usize];
+                let litlen_entry3 =
+                    self.litlen_table[(bit_buffer.buffer >> (litlen_code_bits + litlen_code_bits2)
+                        & Self::LITLEN_TABLE_MASK) as usize];
                 let litlen_code_bits3 = litlen_entry3 as u8;
                 let litlen_entry4 = self.litlen_table[(bit_buffer.buffer
                     >> (litlen_code_bits + litlen_code_bits2 + litlen_code_bits3)
-                    & 0xfff) as usize];
+                    & Self::LITLEN_TABLE_MASK)
+                    as usize];
 
                 let advance_output_bytes = ((litlen_entry & 0xf00) >> 8) as usize;
                 output[output_index] = (litlen_entry >> 16) as u8;
@@ -703,8 +749,8 @@ impl CompressedBlock {
                         litlen_code_bits,
                     )
                 } else if litlen_entry & SECONDARY_TABLE_ENTRY != 0 {
-                    let secondary_table_index =
-                        (litlen_entry >> 16) + ((bits >> 12) as u32 & (litlen_entry & 0xff));
+                    let secondary_table_index = (litlen_entry >> 16)
+                        + ((bits >> Self::LITLEN_TABLE_BITS) as u32 & (litlen_entry & 0xff));
                     let secondary_entry = self.secondary_table[secondary_table_index as usize];
                     let litlen_symbol = secondary_entry >> 4;
                     let litlen_code_bits = (secondary_entry & 0xf) as u8;
@@ -712,7 +758,8 @@ impl CompressedBlock {
                     match litlen_symbol {
                         0..=255 => {
                             bit_buffer.consume_bits(litlen_code_bits);
-                            litlen_entry = self.litlen_table[(bit_buffer.buffer & 0xfff) as usize];
+                            litlen_entry = self.litlen_table
+                                [(bit_buffer.buffer & Self::LITLEN_TABLE_MASK) as usize];
                             bit_buffer.fill_buffer(remaining_input);
                             output[output_index] = litlen_symbol as u8;
                             output_index += 1;
@@ -740,7 +787,7 @@ impl CompressedBlock {
             let length = length_base as usize + (bits & length_extra_mask) as usize;
             bits >>= length_extra_bits;
 
-            let dist_entry = self.dist_table[(bits & 0x1ff) as usize];
+            let dist_entry = self.dist_table[(bits & Self::DIST_TABLE_MASK) as usize];
             let (dist_base, dist_extra_bits, dist_code_bits) = if dist_entry & LITERAL_ENTRY != 0 {
                 (
                     (dist_entry >> 16) as u16,
@@ -750,8 +797,8 @@ impl CompressedBlock {
             } else if dist_entry >> 8 == 0 {
                 return Err(DecompressionError::InvalidDistanceCode);
             } else {
-                let secondary_table_index =
-                    (dist_entry >> 16) + ((bits >> 9) as u32 & (dist_entry & 0xff));
+                let secondary_table_index = (dist_entry >> 16)
+                    + ((bits >> Self::DIST_TABLE_BITS) as u32 & (dist_entry & 0xff));
                 let secondary_entry = self.dist_secondary_table[secondary_table_index as usize];
                 let dist_symbol = (secondary_entry >> 4) as usize;
                 if dist_symbol >= 30 {
@@ -775,7 +822,8 @@ impl CompressedBlock {
                 litlen_code_bits + length_extra_bits + dist_code_bits + dist_extra_bits,
             );
             bit_buffer.fill_buffer(remaining_input);
-            litlen_entry = self.litlen_table[(bit_buffer.buffer & 0xfff) as usize];
+            litlen_entry =
+                self.litlen_table[(bit_buffer.buffer & Self::LITLEN_TABLE_MASK) as usize];
 
             let copy_length = length.min(output.len() - output_index);
             if dist == 1 {
@@ -828,12 +876,12 @@ impl CompressedBlock {
             }
 
             let mut bits = bit_buffer.buffer;
-            let litlen_entry = self.litlen_table[(bits & 0xfff) as usize];
+            let litlen_entry = self.litlen_table[(bits & Self::LITLEN_TABLE_MASK) as usize];
             let litlen_code_bits = litlen_entry as u8;
 
             if litlen_entry & LITERAL_ENTRY != 0 {
-                // Fast path: the next symbol is <= 12 bits and a literal, the table specifies the
-                // output bytes and we can directly write them to the output buffer.
+                // Fast path: the next symbol is <= LITLEN_TABLE_BITS bits and a literal, the table
+                // specifies the output bytes and we can directly write them to the output buffer.
                 let advance_output_bytes = ((litlen_entry & 0xf00) >> 8) as usize;
 
                 if bit_buffer.nbits < litlen_code_bits {
@@ -871,8 +919,8 @@ impl CompressedBlock {
                         litlen_code_bits,
                     )
                 } else if litlen_entry & SECONDARY_TABLE_ENTRY != 0 {
-                    let secondary_table_index =
-                        (litlen_entry >> 16) + ((bits >> 12) as u32 & (litlen_entry & 0xff));
+                    let secondary_table_index = (litlen_entry >> 16)
+                        + ((bits >> Self::LITLEN_TABLE_BITS) as u32 & (litlen_entry & 0xff));
                     let secondary_entry = self.secondary_table[secondary_table_index as usize];
                     let litlen_symbol = secondary_entry >> 4;
                     let litlen_code_bits = (secondary_entry & 0xf) as u8;
@@ -909,20 +957,22 @@ impl CompressedBlock {
             let length = length_base as usize + (bits & length_extra_mask) as usize;
             bits >>= length_extra_bits;
 
-            let dist_entry = self.dist_table[(bits & 0x1ff) as usize];
+            let dist_entry = self.dist_table[(bits & Self::DIST_TABLE_MASK) as usize];
             let (dist_base, dist_extra_bits, dist_code_bits) = if dist_entry & LITERAL_ENTRY != 0 {
                 (
                     (dist_entry >> 16) as u16,
                     (dist_entry >> 8) as u8 & 0xf,
                     dist_entry as u8,
                 )
-            } else if bit_buffer.nbits > litlen_code_bits + length_extra_bits + 9 {
+            } else if bit_buffer.nbits
+                > litlen_code_bits + length_extra_bits + Self::DIST_TABLE_BITS as u8
+            {
                 if dist_entry >> 8 == 0 {
                     return Err(DecompressionError::InvalidDistanceCode);
                 }
 
-                let secondary_table_index =
-                    (dist_entry >> 16) + ((bits >> 9) as u32 & (dist_entry & 0xff));
+                let secondary_table_index = (dist_entry >> 16)
+                    + ((bits >> Self::DIST_TABLE_BITS) as u32 & (dist_entry & 0xff));
                 let secondary_entry = self.dist_secondary_table[secondary_table_index as usize];
                 let dist_symbol = (secondary_entry >> 4) as usize;
                 if dist_symbol >= 30 {
