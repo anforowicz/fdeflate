@@ -107,6 +107,11 @@ pub struct Decompressor {
     state: State,
     checksum: Adler32,
     ignore_adler32: bool,
+
+    idat_bytes: usize,
+    compressed_block_count: usize,
+    uncompressed_block_count: usize,
+    fixed_symbols_block_count: usize,
 }
 
 impl Default for Decompressor {
@@ -116,6 +121,14 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
+    /// Ad-hoc dumping of stats as a JSON snippet.
+    pub fn dump_stats(&self) {
+        println!("    \"idat_bytes\": {},", self.idat_bytes);
+        println!("    \"compressed_block_count\": {},", self.compressed_block_count);
+        println!("    \"uncompressed_block_count\": {},", self.uncompressed_block_count);
+        println!("    \"fixed_symbols_block_count\": {},", self.fixed_symbols_block_count);
+    }
+
     /// Create a new decompressor.
     pub fn new() -> Self {
         Self {
@@ -146,6 +159,10 @@ impl Decompressor {
             last_block: false,
             ignore_adler32: false,
             fixed_table: false,
+            idat_bytes: 0,
+            compressed_block_count: 0,
+            uncompressed_block_count: 0,
+            fixed_symbols_block_count: 0,
         }
     }
 
@@ -191,6 +208,7 @@ impl Decompressor {
         self.last_block = start & 1 != 0;
         match start >> 1 {
             0b00 => {
+                self.uncompressed_block_count += 1;
                 let align_bits = (self.nbits - 3) % 8;
                 let header_bits = 3 + 32 + align_bits;
                 if self.nbits < header_bits {
@@ -209,6 +227,7 @@ impl Decompressor {
                 Ok(())
             }
             0b01 => {
+                self.fixed_symbols_block_count += 1;
                 self.consume_bits(3);
 
                 // Check for an entirely empty blocks which can happen if there are "partial
@@ -251,6 +270,7 @@ impl Decompressor {
                 Ok(())
             }
             0b10 => {
+                self.compressed_block_count += 1;
                 if self.nbits < 17 {
                     return Ok(());
                 }
@@ -1015,7 +1035,9 @@ impl Decompressor {
 
         if self.state == State::Done || !end_of_input || output_index == output.len() {
             let input_left = remaining_input.len();
-            Ok((input.len() - input_left, output_index - output_position))
+            let input_consumed = input.len() - input_left;
+            self.idat_bytes += input_consumed;
+            Ok((input_consumed, output_index - output_position))
         } else {
             Err(DecompressionError::InsufficientInput)
         }
