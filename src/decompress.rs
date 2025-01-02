@@ -334,63 +334,8 @@ impl Decompressor {
             self.header.code_lengths[i] = 0;
         }
 
-        Self::build_tables(
-            self.header.hlit,
-            &self.header.code_lengths,
-            &mut self.compression,
-        )?;
+        self.compression.build_tables(self.header.hlit, &self.header.code_lengths)?;
         self.state = State::CompressedData;
-        Ok(())
-    }
-
-    fn build_tables(
-        hlit: usize,
-        code_lengths: &[u8],
-        compression: &mut CompressedBlock<4096, 512>,
-    ) -> Result<(), DecompressionError> {
-        // If there is no code assigned for the EOF symbol then the bitstream is invalid.
-        if code_lengths[256] == 0 {
-            // TODO: Return a dedicated error in this case.
-            return Err(DecompressionError::BadLiteralLengthHuffmanTree);
-        }
-
-        let mut codes = [0; 288];
-        compression.secondary_table.clear();
-        if !huffman::build_table(
-            &code_lengths[..hlit],
-            &LITLEN_TABLE_ENTRIES,
-            &mut codes[..hlit],
-            &mut *compression.litlen_table,
-            &mut compression.secondary_table,
-            false,
-            true,
-        ) {
-            return Err(DecompressionError::BadCodeLengthHuffmanTree);
-        }
-
-        compression.eof_code = codes[256];
-        compression.eof_mask = (1 << code_lengths[256]) - 1;
-        compression.eof_bits = code_lengths[256];
-
-        // Build the distance code table.
-        let lengths = &code_lengths[288..320];
-        if lengths == [0; 32] {
-            compression.dist_table.fill(0);
-        } else {
-            let mut dist_codes = [0; 32];
-            if !huffman::build_table(
-                lengths,
-                &tables::DISTANCE_TABLE_ENTRIES,
-                &mut dist_codes,
-                &mut *compression.dist_table,
-                &mut compression.dist_secondary_table,
-                true,
-                false,
-            ) {
-                return Err(DecompressionError::BadDistanceHuffmanTree);
-            }
-        }
-
         Ok(())
     }
 
@@ -652,6 +597,57 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
             eof_mask: 0,
             eof_bits: 0,
         }
+    }
+
+    fn build_tables(
+        &mut self,
+        hlit: usize,
+        code_lengths: &[u8],
+    ) -> Result<(), DecompressionError> {
+        // If there is no code assigned for the EOF symbol then the bitstream is invalid.
+        if code_lengths[256] == 0 {
+            // TODO: Return a dedicated error in this case.
+            return Err(DecompressionError::BadLiteralLengthHuffmanTree);
+        }
+
+        let mut codes = [0; 288];
+        self.secondary_table.clear();
+        if !huffman::build_table(
+            &code_lengths[..hlit],
+            &LITLEN_TABLE_ENTRIES,
+            &mut codes[..hlit],
+            &mut *self.litlen_table,
+            &mut self.secondary_table,
+            false,
+            true,
+        ) {
+            return Err(DecompressionError::BadCodeLengthHuffmanTree);
+        }
+
+        self.eof_code = codes[256];
+        self.eof_mask = (1 << code_lengths[256]) - 1;
+        self.eof_bits = code_lengths[256];
+
+        // Build the distance code table.
+        let lengths = &code_lengths[288..320];
+        if lengths == [0; 32] {
+            self.dist_table.fill(0);
+        } else {
+            let mut dist_codes = [0; 32];
+            if !huffman::build_table(
+                lengths,
+                &tables::DISTANCE_TABLE_ENTRIES,
+                &mut dist_codes,
+                &mut *self.dist_table,
+                &mut self.dist_secondary_table,
+                true,
+                false,
+            ) {
+                return Err(DecompressionError::BadDistanceHuffmanTree);
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns:
@@ -1253,7 +1249,7 @@ mod tests {
             eof_mask: 0,
             eof_bits: 0,
         };
-        Decompressor::build_tables(288, &FIXED_CODE_LENGTHS, &mut compression).unwrap();
+        compression.build_tables(288, &FIXED_CODE_LENGTHS).unwrap();
 
         assert_eq!(compression.litlen_table[..512], FIXED_LITLEN_TABLE);
         assert_eq!(compression.dist_table[..32], FIXED_DIST_TABLE);
