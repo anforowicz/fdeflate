@@ -246,14 +246,33 @@ impl Decompressor {
                     self.read_code_lengths(&mut remaining_input)?;
                 }
                 State::CompressedData => {
-                    let (compresed_block_status, new_output_index) =
+                    let (compresed_block_status, new_output_index) = if self.fixed_table {
+                        const EOF_BITS: u8 = 7;
+                        const EOF_CODE: u16 = 0;
+                        const EOF_MASK: u16 = 0x7f;
+                        read_compressed_impl(
+                            &FIXED_LITLEN_TABLE,
+                            &[],
+                            &FIXED_DIST_TABLE,
+                            &[],
+                            EOF_CODE,
+                            EOF_MASK,
+                            EOF_BITS,
+                            &mut self.bits,
+                            &mut remaining_input,
+                            output,
+                            output_index,
+                            &mut self.queued_output,
+                        )?
+                    } else {
                         self.compression.read_compressed(
                             &mut self.bits,
                             &mut remaining_input,
                             output,
                             output_index,
                             &mut self.queued_output,
-                        )?;
+                        )?
+                    };
                     output_index = new_output_index;
                     if compresed_block_status == CompressedBlockStatus::ReachedEndOfBlock {
                         self.state = match self.last_block {
@@ -391,20 +410,7 @@ impl Decompressor {
                     return self.read_block_header(remaining_input);
                 }
 
-                // Build decoding tables if the previous block wasn't also a fixed block.
-                if !self.fixed_table {
-                    self.fixed_table = true;
-                    for chunk in self.compression.litlen_table.chunks_exact_mut(512) {
-                        chunk.copy_from_slice(&FIXED_LITLEN_TABLE);
-                    }
-                    for chunk in self.compression.dist_table.chunks_exact_mut(32) {
-                        chunk.copy_from_slice(&FIXED_DIST_TABLE);
-                    }
-                    self.compression.eof_bits = 7;
-                    self.compression.eof_code = 0;
-                    self.compression.eof_mask = 0x7f;
-                }
-
+                self.fixed_table = true;
                 self.state = State::CompressedData;
                 Ok(())
             }
@@ -1245,7 +1251,7 @@ mod tests {
         compression.build_tables(288, &FIXED_CODE_LENGTHS).unwrap();
 
         assert_eq!(compression.litlen_table[..512], FIXED_LITLEN_TABLE);
-        assert_eq!(compression.dist_table[..32], FIXED_DIST_TABLE);
+        assert_eq!(compression.dist_table[..128], FIXED_DIST_TABLE);
     }
 
     #[test]
