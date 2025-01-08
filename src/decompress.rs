@@ -2,7 +2,7 @@ use simd_adler32::Adler32;
 use std::num::NonZeroUsize;
 
 use crate::{
-    huffman::{self, build_table},
+    huffman::{self, build_table, BlockProperties},
     tables::{
         self, CLCL_ORDER, DIST_SYM_TO_DIST_BASE, DIST_SYM_TO_DIST_EXTRA, FIXED_DIST_TABLE,
         FIXED_LITLEN_TABLE, LEN_SYM_TO_LEN_BASE, LEN_SYM_TO_LEN_EXTRA, LITLEN_TABLE_ENTRIES,
@@ -94,6 +94,7 @@ pub struct Decompressor {
     compression: CompressedBlock,
     // State for decoding a block header.
     header: BlockHeader,
+    first_block_properties: Option<huffman::BlockProperties>,
     // Number of bytes left for uncompressed block.
     uncompressed_bytes_left: u16,
 
@@ -106,6 +107,11 @@ pub struct Decompressor {
     state: State,
     checksum: Adler32,
     ignore_adler32: bool,
+
+    idat_bytes: usize,
+    compressed_block_count: usize,
+    uncompressed_block_count: usize,
+    fixed_symbols_block_count: usize,
 }
 
 impl Default for Decompressor {
@@ -115,6 +121,27 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
+    pub fn get_first_block_properties(&self) -> Option<&huffman::BlockProperties> {
+        self.first_block_properties.as_ref()
+    }
+
+    /// Ad-hoc dumping of stats as a JSON snippet.
+    pub fn dump_stats(&self) {
+        println!("    \"idat_bytes\": {},", self.idat_bytes);
+        println!(
+            "    \"compressed_block_count\": {},",
+            self.compressed_block_count
+        );
+        println!(
+            "    \"uncompressed_block_count\": {},",
+            self.uncompressed_block_count
+        );
+        println!(
+            "    \"fixed_symbols_block_count\": {},",
+            self.fixed_symbols_block_count
+        );
+    }
+
     /// Create a new decompressor.
     pub fn new() -> Self {
         Self {
@@ -136,6 +163,7 @@ impl Decompressor {
                 num_lengths_read: 0,
                 code_lengths: [0; 320],
             },
+            first_block_properties: None,
             uncompressed_bytes_left: 0,
             queued_output: None,
             checksum: Adler32::new(),
@@ -143,6 +171,10 @@ impl Decompressor {
             last_block: false,
             ignore_adler32: false,
             fixed_table: false,
+            idat_bytes: 0,
+            compressed_block_count: 0,
+            uncompressed_block_count: 0,
+            fixed_symbols_block_count: 0,
         }
     }
 
@@ -161,6 +193,7 @@ impl Decompressor {
         self.last_block = start & 1 != 0;
         match start >> 1 {
             0b00 => {
+                self.uncompressed_block_count += 1;
                 let align_bits = (self.bits.nbits - 3) % 8;
                 let header_bits = 3 + 32 + align_bits;
                 if self.bits.nbits < header_bits {
@@ -179,6 +212,7 @@ impl Decompressor {
                 Ok(())
             }
             0b01 => {
+                self.fixed_symbols_block_count += 1;
                 self.bits.consume_bits(3);
 
                 // Check for an entirely empty blocks which can happen if there are "partial
@@ -221,6 +255,7 @@ impl Decompressor {
                 Ok(())
             }
             0b10 => {
+                self.compressed_block_count += 1;
                 if self.bits.nbits < 17 {
                     return Ok(());
                 }
@@ -360,6 +395,7 @@ impl Decompressor {
             self.header.hlit,
             &self.header.code_lengths,
             &mut self.compression,
+            &mut self.first_block_properties,
         )?;
         self.state = State::CompressedData;
         Ok(())
@@ -369,6 +405,7 @@ impl Decompressor {
         hlit: usize,
         code_lengths: &[u8],
         compression: &mut CompressedBlock,
+        properties: &mut Option<huffman::BlockProperties>,
     ) -> Result<(), DecompressionError> {
         // If there is no code assigned for the EOF symbol then the bitstream is invalid.
         if code_lengths[256] == 0 {
@@ -388,6 +425,10 @@ impl Decompressor {
             true,
         ) {
             return Err(DecompressionError::BadCodeLengthHuffmanTree);
+        }
+
+        if properties.is_none() {
+            *properties = Some(huffman::BlockProperties::new(&code_lengths[..hlit]));
         }
 
         compression.eof_code = codes[256];
@@ -985,7 +1026,9 @@ impl Decompressor {
 
         if self.state == State::Done || !end_of_input || output_index == output.len() {
             let input_left = remaining_input.len();
-            Ok((input.len() - input_left, output_index - output_position))
+            let input_consumed = input.len() - input_left;
+            self.idat_bytes += input_consumed;
+            Ok((input_consumed, output_index - output_position))
         } else {
             Err(DecompressionError::InsufficientInput)
         }
@@ -1197,7 +1240,8 @@ mod tests {
             eof_mask: 0,
             eof_bits: 0,
         };
-        Decompressor::build_tables(288, &FIXED_CODE_LENGTHS, &mut compression).unwrap();
+        let mut p = None;
+        Decompressor::build_tables(288, &FIXED_CODE_LENGTHS, &mut compression, &mut p).unwrap();
 
         assert_eq!(compression.litlen_table[..512], FIXED_LITLEN_TABLE);
         assert_eq!(compression.dist_table[..32], FIXED_DIST_TABLE);

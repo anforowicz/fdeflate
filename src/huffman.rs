@@ -183,9 +183,101 @@ pub fn build_table(
     true
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockProperties {
+    pub doubles_for_9_bit_table: usize,
+    pub doubles_for_12_bit_table: usize,
+    pub singles_for_9_bit_table: usize,
+    pub singles_for_12_bit_table: usize,
+    pub colds_for_9_bit_table: usize,
+    pub colds_for_12_bit_table: usize,
+}
+
+impl BlockProperties {
+    pub fn new(code_lengths: &[u8]) -> Self {
+        let mut lit_histogram = [0; 16];
+        for &length in &code_lengths[..code_lengths.len().min(256)] {
+            lit_histogram[length as usize] += 1;
+        }
+
+        // Frequency-weighted count of symbols that will trigger leaving the hot loop:
+        // * All distance codes
+        // * Literals that require a secondary table lookup
+        let mut colds_for_9_bit_table = 0;
+        let mut colds_for_12_bit_table = 0;
+        if code_lengths.len() >= 256 {
+            for len in &code_lengths[256..] {
+                // https://github.com/image-rs/fdeflate/issues/45#issuecomment-2576765340
+                // points out that an n-bit code occurs with frequency 1/2^n.  So we can
+                // give 1-bit symbols a weight of 2^15, 2-bit symbols a weight of 2^14, and so
+                // forth.
+                let weight = 0x8000 >> len;
+                colds_for_9_bit_table += weight;
+                colds_for_12_bit_table += weight;
+            }
+        }
+        for lit_len in 10..16 {
+            let weight = 0x8000 >> lit_len;
+            let weight = weight * lit_histogram[lit_len];
+            colds_for_9_bit_table += weight;
+            if lit_len > 12 {
+                colds_for_12_bit_table += weight;
+            }
+        }
+
+        // `weight[len]` is the weight of all literals of length `len`.
+        // `weight_prefix_sum[n]` is the sum of `weight[i]` for `i` in `1..=n`.
+        let mut weight: [usize; 16] = [0; 16];
+        let mut weight_prefix_sum: [usize; 16] = [0; 16];
+        for (len, &count) in lit_histogram.iter().enumerate().skip(1) {
+            let w = 0x8000 >> len;
+            let w = w * count;
+            weight[len] = w;
+            weight_prefix_sum[len] = weight_prefix_sum[len - 1] + w;
+        }
+
+        // Frequency-weighted count of how often litlen table entries translate into 1) a double
+        // literal or 2) a single literal.  These ignore distance codes and secondary table
+        // lookups.
+        let mut doubles_for_9_bit_table = 0;
+        let mut doubles_for_12_bit_table = 0;
+        let mut singles_for_9_bit_table = 0;
+        let mut singles_for_12_bit_table = 0;
+        for len1 in 1..12 {
+            assert!(len1 < 12);
+            let len2 = 12 - len1;
+
+            // When `len2`-long symbol is paired with `0..=len1`-long symbol, then
+            // they both fit into a primary table key.
+            doubles_for_12_bit_table += weight[len2] * weight_prefix_sum[len1];
+            // When `len2`-long symbol is paired with `len1+1..=15`-long symbol, then
+            // only `len2` symbol will fit.
+            singles_for_12_bit_table += weight[len2] * (
+                weight_prefix_sum[15] - weight_prefix_sum[len1]
+            );
+            if len1 < 9 {
+                let len2 = 9 - len1;
+                doubles_for_9_bit_table += weight[len2] * weight_prefix_sum[len1];
+                singles_for_9_bit_table += weight[len2] * (
+                    weight_prefix_sum[15] - weight_prefix_sum[len1]
+                );
+            }
+        }
+
+        Self {
+            doubles_for_9_bit_table,
+            doubles_for_12_bit_table,
+            singles_for_9_bit_table,
+            singles_for_12_bit_table,
+            colds_for_9_bit_table,
+            colds_for_12_bit_table,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{LITERAL_ENTRY, SECONDARY_TABLE_ENTRY};
+    use super::{BlockProperties, LITERAL_ENTRY, SECONDARY_TABLE_ENTRY};
     use crate::tables::LITLEN_TABLE_ENTRIES;
 
     fn validate_tables(
@@ -446,8 +538,7 @@ mod test {
         //    14      15      111_1111_1111_1110
         //    15      15      111_1111_1111_1111
         let t = LitlenTables::new(12, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15])
-            .unwrap();
-        assert_eq!(
+            .unwrap(); assert_eq!(
             t.decode(0b_0_0_000000_u8.reverse_bits() as u64),
             LitlenResult::DoubleLiteral {
                 s1: 0,
@@ -476,6 +567,23 @@ mod test {
                 symbol: 15,
                 input_bits: 15
             },
+        );
+    }
+
+    #[test]
+    fn test_block_properties() {
+        let p = BlockProperties::new(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15]);
+        assert_eq!(p.doubles_for_9_bit_table, 1052770304);
+        assert_eq!(p.doubles_for_12_bit_table, 1070333952);
+        assert_eq!(p.singles_for_9_bit_table, 16777216);
+        assert_eq!(p.singles_for_12_bit_table, 2883584);
+        assert_eq!(
+            p.colds_for_9_bit_table,
+            32 + 16 + 8 + 4 + 2 + 1 + 1,
+        );
+        assert_eq!(
+            p.colds_for_12_bit_table,
+            4 + 2 + 1 + 1,
         );
     }
 }

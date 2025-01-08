@@ -23,7 +23,7 @@
 
 mod compress;
 mod decompress;
-mod huffman;
+pub mod huffman;
 mod tables;
 
 pub use compress::{compress_to_vec, Compressor, StoredOnlyCompressor};
